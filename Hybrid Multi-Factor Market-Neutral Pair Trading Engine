@@ -1,0 +1,528 @@
+# upstox_pair_scanner_resilient_final.py
+"""
+Resilient Upstox pair scanner (ready-to-run).
+- Multi-source instrument master (remote, local, builtin fallback)
+- Robust HTTP session with retries/timeouts
+- Flexible historical endpoints and date-order fallbacks
+- ThreadPool parallel fetch; per-call timeouts so nothing freezes
+- Auto base-symbol selection
+- Fundamental filter: P/B < 2 and P/E < 50 (applied when available)
+- DRY_RUN default (no live orders)
+"""
+
+import os
+import time
+import math
+import json
+import requests
+import gzip
+import io
+import numpy as np
+import pandas as pd
+from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+try:
+    from statsmodels.tsa.stattools import coint
+except Exception:
+    coint = None  # optional
+
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
+# ---------------- USER CONFIG ----------------
+ACCESS_TOKEN = ""   # <<-- set this
+DRY_RUN = True
+
+# date / time config (use YYYY-MM-DD)
+FROM_DATE = "2025-12-22"   # inclusive start
+TO_DATE   = "2025-12-23"   # inclusive end
+INTERVAL = "1minute"       # e.g., '1minute', '5minute', 'day'
+MIN_HISTORY_ROWS = 30
+MAX_CANDIDATES = 1000
+
+# concurrency / networking
+MAX_WORKERS = 8
+REQUEST_TIMEOUT = 9  # seconds per request
+SESSION_RETRIES = 2
+BACKOFF = 0.3
+THROTTLE_SEC = 0.05
+
+# Upstox endpoints
+UPSTOX_BASE = "https://api.upstox.com"
+UPSTOX_SANDBOX_BASE = "https://api-sandbox.upstox.com"
+
+# instrument master URLs (try in order)
+INSTRUMENT_MASTER_URLS = [
+    "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz",
+    "https://assets-v2.upstox.com/market-quote/instruments/exchange/complete.json.gz",
+    "https://assets.upstox.com/market-quote/instruments/instruments.csv",
+    "https://assets-v2.upstox.com/market-quote/instruments/instruments.csv"
+]
+
+# local fallback filename (optional). If present, it will be used.
+LOCAL_MASTER_CSV = "instruments_local.csv"
+
+# built-in minimal fallback candidate list (NSE ISINs) — ensures the scanner can run offline/network-limited.
+BUILTIN_FALLBACK_ISINS = [
+    " INE267A01025"  # DCB Bank
+  # AXISBANK
+]
+
+# fundamental filters
+PE_MAX = 50.0
+PB_MAX = 2.0
+
+# ---------------- utilities ----------------
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def log(s):
+    print(f"[{now_iso()}] {s}")
+
+# ---------------- session with retry ----------------
+def make_session(retries=SESSION_RETRIES, backoff_factor=BACKOFF, status_forcelist=(429,500,502,503,504)):
+    s = requests.Session()
+    retry = Retry(total=retries, read=retries, connect=retries, backoff_factor=backoff_factor,
+                  status_forcelist=status_forcelist, allowed_methods=False)
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+SESSION = make_session()
+
+# ---------------- instrument master loader ----------------
+def try_download_master_json(url):
+    try:
+        r = SESSION.get(url, timeout=12)
+        r.raise_for_status()
+        # some urls are json.gz, some are csv; attempt json parsing first
+        content_type = r.headers.get("Content-Type", "").lower()
+        if url.endswith(".gz") or "gzip" in r.headers.get("Content-Encoding",""):
+            try:
+                with gzip.GzipFile(fileobj=io.BytesIO(r.content)) as f:
+                    data = json.load(f)
+                return pd.DataFrame(data)
+            except Exception:
+                # fallback: try decode as text and parse json
+                try:
+                    data = json.loads(r.content.decode())
+                    return pd.DataFrame(data)
+                except Exception:
+                    return None
+        elif "application/json" in content_type or url.endswith(".json"):
+            try:
+                data = r.json()
+                return pd.DataFrame(data)
+            except Exception:
+                return None
+        elif url.endswith(".csv") or "text/csv" in content_type:
+            try:
+                return pd.read_csv(io.StringIO(r.text))
+            except Exception:
+                return None
+        else:
+            # try to interpret as json, then csv
+            try:
+                return pd.DataFrame(r.json())
+            except Exception:
+                try:
+                    return pd.read_csv(io.StringIO(r.text))
+                except Exception:
+                    return None
+    except Exception as e:
+        return None
+
+def load_instrument_master():
+    # Try remote URLs
+    for url in INSTRUMENT_MASTER_URLS:
+        log(f"Attempting instrument master: {url}")
+        df = try_download_master_json(url)
+        if df is not None and not df.empty:
+            log(f"Loaded instrument master from {url} rows={len(df)}")
+            return df
+        log(f"Failed to load master from {url}")
+
+    # Try local file
+    if os.path.exists(LOCAL_MASTER_CSV):
+        try:
+            df = pd.read_csv(LOCAL_MASTER_CSV)
+            log(f"Loaded instrument master from local file {LOCAL_MASTER_CSV} rows={len(df)}")
+            return df
+        except Exception as e:
+            log(f"Failed to read local master: {e}")
+
+    # Built-in fallback: create minimal master from ISINs above
+    log("Using builtin fallback instrument master (minimal blue-chips).")
+    rows = []
+    for isin in BUILTIN_FALLBACK_ISINS:
+        rows.append({"isin": isin, "tradingsymbol": None, "token": None, "exchange":"NSE_EQ"})
+    return pd.DataFrame(rows)
+
+# ---------------- helper: build mapping ----------------
+def build_isin_to_mapping(df):
+    mapping = {}
+    if df is None or df.empty:
+        return mapping
+    cols = {c.lower(): c for c in df.columns}
+    isin_col = next((cols.get(k) for k in ["isin","isin_code","isin_no"] if k in cols), None)
+    trad_col = next((cols.get(k) for k in ["tradingsymbol","trading_symbol","symbol"] if k in cols), None)
+    tok_col = next((cols.get(k) for k in ["token","instrument_token","exchange_token"] if k in cols), None)
+    for _, row in df.iterrows():
+        try:
+            isin = str(row[isin_col]).strip() if isin_col and not pd.isna(row[isin_col]) else None
+            trad = str(row[trad_col]).strip() if trad_col and not pd.isna(row[trad_col]) else ""
+            tok = str(row[tok_col]).strip() if tok_col and not pd.isna(row[tok_col]) else ""
+            if isin:
+                try:
+                    num_token = int(float(tok)) if tok not in (None,"","nan") else None
+                except:
+                    num_token = None
+                mapping[isin] = {"trad": trad, "token_str": tok, "num_token": num_token}
+        except Exception:
+            continue
+    return mapping
+
+# ---------------- historical candles fetcher (robust) ----------------
+def fetch_candles(symbol, interval, to_date, from_date):
+    """
+    Tries several endpoint shapes and date order permutations. Returns pd.DataFrame with index=ts and column 'close'.
+    """
+    # two endpoint shapes to try
+    endpoints = [
+        f"{UPSTOX_BASE}/v2/historical-candle/{symbol}/{interval}/{to_date}/{from_date}",
+        f"{UPSTOX_BASE}/v2/historical-candle/{symbol}/{interval}/{from_date}/{to_date}",
+        f"{UPSTOX_SANDBOX_BASE}/v2/historical-candle/{symbol}/{interval}/{to_date}/{from_date}",
+        f"{UPSTOX_SANDBOX_BASE}/v2/historical-candle/{symbol}/{interval}/{from_date}/{to_date}",
+    ]
+    # also try 'ohlc' endpoint shape
+    ohlc_templates = [
+        f"{UPSTOX_BASE}/v2/market/ohlc?instrument_key={requests.utils.quote(symbol)}&interval={{intp}}&limit=1000",
+        f"{UPSTOX_SANDBOX_BASE}/v2/market/ohlc?instrument_key={requests.utils.quote(symbol)}&interval={{intp}}&limit=1000"
+    ]
+    # map interval to common param for ohlc
+    int_map = {"1minute":"1m","5minute":"5m","15minute":"15m","day":"1d","1day":"1d"}
+    intp = int_map.get(interval, interval)
+
+    headers = {"Accept":"application/json", "Authorization": f"Bearer {ACCESS_TOKEN}"}
+
+    # Try endpoints first
+    for url in endpoints:
+        try:
+            r = SESSION.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            if r.status_code != 200:
+                continue
+            js = r.json()
+            candles = (js.get("data", {}) or {}).get("candles", []) or []
+            rows = []
+            for c in candles:
+                if isinstance(c, (list,tuple)) and len(c) >= 5:
+                    rows.append([c[0], c[4]])
+                elif isinstance(c, dict):
+                    ts = c.get("timestamp") or c.get("time") or c.get("dt")
+                    close = c.get("close")
+                    rows.append([ts, close])
+            if not rows:
+                continue
+            df = pd.DataFrame(rows, columns=["ts","close"])
+            # if ts numeric assume ms
+            if pd.api.types.is_numeric_dtype(df["ts"]):
+                df["ts"] = pd.to_datetime(df["ts"], unit="ms", errors="coerce")
+            else:
+                df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+            df = df.set_index("ts").sort_index()
+            df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            df = df.dropna()
+            if df.empty:
+                continue
+            return df
+        except Exception:
+            continue
+
+    # Try ohlc endpoints
+    for tmpl in ohlc_templates:
+        url = tmpl.format(intp=intp)
+        try:
+            r = SESSION.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            if r.status_code != 200:
+                continue
+            js = r.json()
+            candles = (js.get("data", {}) or {}).get("ohlc", []) or []
+            rows = []
+            for c in candles:
+                if isinstance(c, dict):
+                    ts = c.get("timestamp") or c.get("time") or c.get("dt")
+                    close = c.get("close") or c.get("c")
+                    if ts is None or close is None: continue
+                    rows.append([ts, close])
+                elif isinstance(c, (list,tuple)) and len(c) >= 5:
+                    rows.append([c[0], c[4]])
+            if not rows:
+                continue
+            df = pd.DataFrame(rows, columns=["ts","close"])
+            if pd.api.types.is_numeric_dtype(df["ts"]):
+                df["ts"] = pd.to_datetime(df["ts"], unit="ms", errors="coerce")
+            else:
+                df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+            df = df.set_index("ts").sort_index()
+            df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            df = df.dropna()
+            if df.empty:
+                continue
+            return df
+        except Exception:
+            continue
+
+    # ultimate fallback: empty DataFrame
+    return pd.DataFrame(columns=["close"])
+
+# ---------------- scoring / stats helpers ----------------
+def pair_stats(logA, logB):
+    if len(logA) < 5: return None
+    x = logB.values; y = logA.values
+    cov = np.cov(x, y, ddof=1)
+    varB = cov[0,0]; covAB = cov[0,1]
+    if varB <= 0 or np.isnan(varB): return None
+    beta = covAB / varB
+    corr = np.corrcoef(x,y)[0,1]
+    r2 = corr**2 if not np.isnan(corr) else 0.0
+    sub = max(10, len(logA)//10)
+    betas = []
+    for i in range(0, len(logA)-sub+1):
+        xx = logB.iloc[i:i+sub].values; yy = logA.iloc[i:i+sub].values
+        c = np.cov(xx, yy, ddof=1)
+        if c[0,0] <= 0: continue
+        betas.append(c[0,1]/c[0,0])
+    beta_vol = float(np.nanstd(betas)) if betas else float("nan")
+    return {"beta": float(beta), "corr": float(corr), "r2": float(r2), "beta_vol": beta_vol, "n": len(logA)}
+
+def score_quant(stats):
+    if stats is None: return -np.inf
+    bv = stats["beta_vol"] if stats["beta_vol"]>0 else 1e-9
+    s = abs(stats["corr"])*(stats["r2"]+1e-6)/bv
+    s *= math.sqrt(stats["n"])
+    return float(s)
+
+# ---------------- fundamentals (optional) ----------------
+def ticker_from_trad(trad): return trad + ".NS" if trad else None
+
+def safe_float(x):
+    try: return float(x)
+    except: return np.nan
+
+def fetch_fundamentals_yf(trad):
+    if yf is None:
+        return {}
+    t = ticker_from_trad(trad)
+    if not t: return {}
+    try:
+        y = yf.Ticker(t)
+        info = getattr(y, "info", {}) or {}
+        hist = pd.DataFrame()
+        try:
+            hist = y.history(period="1y", interval="1d")
+        except Exception:
+            hist = pd.DataFrame()
+        pe = safe_float(info.get("trailingPE") or info.get("forwardPE"))
+        pb = safe_float(info.get("priceToBook"))
+        roe = safe_float(info.get("returnOnEquity"))
+        revg = np.nan
+        try:
+            fin = getattr(y, "financials", pd.DataFrame())
+            if isinstance(fin, pd.DataFrame) and not fin.empty:
+                rev = fin.iloc[0,:].astype(float)
+                if len(rev) >= 2:
+                    revg = (rev.iloc[0] - rev.iloc[1])/(abs(rev.iloc[1])+1e-9)
+        except Exception:
+            revg = np.nan
+        momentum = np.nan
+        if not hist.empty:
+            try:
+                momentum = (hist["Close"].iloc[-1]/hist["Close"].iloc[0]) - 1.0
+            except Exception:
+                momentum = np.nan
+        last_price = safe_float(info.get("regularMarketPrice") or (hist["Close"].iloc[-1] if not hist.empty else np.nan))
+        mcap = safe_float(info.get("marketCap"))
+        return {"pe":pe,"pb":pb,"roe":roe,"rev_growth":revg,"momentum":momentum,"price":last_price,"mcap":mcap}
+    except Exception:
+        return {}
+
+# ---------------- sizing/ordering (DRY_RUN safe) ----------------
+def hedge_sizing(price_A, price_B, beta, capital=1_000_000.0, risk=0.6):
+    if price_A <= 0 or price_B <= 0 or beta is None or np.isnan(beta):
+        return {"uA":0,"uB":0,"uB_full":0}
+    uA = capital / price_A
+    uB_full = beta * uA
+    uB = uB_full * risk
+    return {"uA":uA,"uB_full":uB_full,"uB":uB}
+
+def place_order_numeric(instrument_token, quantity, side="BUY"):
+    payload = {"instrument_token":int(instrument_token),"quantity":int(quantity),"side":side}
+    if DRY_RUN:
+        log(f"[DRY_RUN] would place order: {payload}")
+        return {"dry_run": True, "payload": payload}
+    # Real order placement left intentionally minimal — adapt to your account details
+    try:
+        url = UPSTOX_BASE + "/v3/order/place"
+        r = SESSION.post(url, headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}, json=payload, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+# ---------------- pick valid base symbol ----------------
+def pick_valid_base(candidates, interval, to_date, from_date, min_rows):
+    for sym in candidates:
+        log(f"Trying base candidate: {sym}")
+        df = fetch_candles(sym, interval, to_date, from_date)
+        if df is None or df.empty or len(df) < min_rows:
+            log(f"Candidate {sym} insufficient rows ({None if df is None else len(df)})")
+            continue
+        log(f"Selected base: {sym} rows={len(df)}")
+        return sym, df
+    raise RuntimeError("No valid base symbol found in candidate list.")
+
+# ---------------- main scan ----------------
+def main():
+    log("Starting resilient Upstox pair scanner")
+
+    # Load instrument master
+    df_master = load_instrument_master()
+    # normalize columns a bit
+    if df_master is None or df_master.empty:
+        log("Instrument master empty — using builtin ISIN list")
+        mapping = {isin: {"trad": None, "num_token": None} for isin in BUILTIN_FALLBACK_ISINS}
+        candidates = ["NSE_EQ|" + isin for isin in BUILTIN_FALLBACK_ISINS]
+    else:
+        mapping = build_isin_to_mapping(df_master)
+        # build candidate list from mapping keys (ISINs)
+        candidates = ["NSE_EQ|" + isin for isin in mapping.keys() if str(isin).strip().startswith("INE")]
+        if not candidates:
+            # fallback to builtin
+            candidates = ["NSE_EQ|" + isin for isin in BUILTIN_FALLBACK_ISINS]
+            mapping = {isin: {"trad": None, "num_token": None} for isin in BUILTIN_FALLBACK_ISINS}
+
+    # limit
+    candidates = candidates[:MAX_CANDIDATES]
+    log(f"Candidates prepared: {len(candidates)} (limit {MAX_CANDIDATES})")
+
+    # pick valid base
+    try:
+        base_sym, dfA = pick_valid_base(candidates, INTERVAL, TO_DATE, FROM_DATE, MIN_HISTORY_ROWS)
+    except Exception as e:
+        # if pick failed, try builtin fallback list explicitly
+        log("Auto base select failed: " + str(e))
+        fb = ["NSE_EQ|" + i for i in BUILTIN_FALLBACK_ISINS]
+        try:
+            base_sym, dfA = pick_valid_base(fb, INTERVAL, TO_DATE, FROM_DATE, MIN_HISTORY_ROWS)
+        except Exception as ex:
+            log("Fallback base selection failed. Exiting.")
+            raise RuntimeError("No viable base symbol.") from ex
+
+    price_A_latest = dfA["close"].iloc[-1]
+    log(f"Base symbol: {base_sym} latest price: {price_A_latest} rows={len(dfA)}")
+
+    # remove base from scanning list
+    scan_candidates = [c for c in candidates if c != base_sym]
+    results = []
+    fund_cache = {}
+
+    # thread pool scanning
+    log(f"Starting parallel scan on {len(scan_candidates)} symbols with {MAX_WORKERS} workers...")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(process_candidate, sym, dfA, price_A_latest, mapping, fund_cache): sym for sym in scan_candidates}
+
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                res = fut.result(timeout=REQUEST_TIMEOUT + 3)
+            except Exception:
+                res = None
+            if res:
+                results.append(res)
+
+    if not results:
+        log("No valid pairs found.")
+        return
+
+    dfres = pd.DataFrame(results).sort_values("composite_score", ascending=False)
+    out_csv = "pair_results_resilient_final.csv"
+    dfres.to_csv(out_csv, index=False)
+    log(f"Results saved to {out_csv}. Top 5:")
+    print(dfres.head(5).to_string(index=False))
+
+# ---------------- worker function for scanning (kept outside to allow pickling) ----------------
+def process_candidate(sym, dfA, price_A_latest, mapping, fund_cache):
+    try:
+        time.sleep(THROTTLE_SEC)
+        dfB = fetch_candles(sym, INTERVAL, TO_DATE, FROM_DATE)
+        if dfB is None or dfB.empty or len(dfB) < MIN_HISTORY_ROWS:
+            return None
+        merged = dfA.join(dfB, how="inner", lsuffix="_A", rsuffix="_B")
+        if len(merged) < MIN_HISTORY_ROWS:
+            return None
+
+        logA = np.log(merged["close_A"])
+        logB = np.log(merged["close_B"])
+        st = pair_stats(logA, logB)
+        if st is None:
+            return None
+        sc = score_quant(st)
+        pv = None
+        if coint is not None:
+            try:
+                _, pv, _ = coint(logA, logB)
+            except Exception:
+                pv = None
+
+        price_B_latest = merged["close_B"].iloc[-1]
+        sizing = hedge_sizing(price_A_latest, price_B_latest, st["beta"])
+
+        isin = sym.split("|")[-1]
+        meta = mapping.get(isin, {})
+        trad = meta.get("trad","") if meta else ""
+        num_token = meta.get("num_token") if meta else None
+
+        fund_metrics = {}
+        if trad:
+            if trad not in fund_cache:
+                fund_cache[trad] = fetch_fundamentals_yf(trad)
+            fund_metrics = fund_cache[trad]
+
+        pe = safe_float(fund_metrics.get("pe"))
+        pb = safe_float(fund_metrics.get("pb"))
+
+        # fundamental filter
+        if (not np.isnan(pe) and pe >= PE_MAX) or (not np.isnan(pb) and pb >= PB_MAX):
+            return None
+
+        roe = safe_float(fund_metrics.get("roe"))
+        revg = safe_float(fund_metrics.get("rev_growth"))
+        mom = safe_float(fund_metrics.get("momentum"))
+
+        val_score = 0.0
+        if pe>0 and not np.isnan(pe): val_score += 1.0/(1.0+math.log(1+pe))
+        if pb>0 and not np.isnan(pb): val_score += 1.0/(1.0+math.log(1+pb))
+        qual_score = max(0.0, min(1.0, (roe/0.25))) if not np.isnan(roe) else 0.0
+        growth_score = ((max(-1.0, min(1.0, revg))+1.0)/2.0) if not np.isnan(revg) else 0.0
+        mom_score = ((max(-1.0, min(1.0, mom))+1.0)/2.0) if not np.isnan(mom) else 0.0
+        fund_score = 0.3*val_score + 0.3*qual_score + 0.2*growth_score + 0.2*mom_score
+        fund_score = max(0.0, min(1.0, fund_score))
+        composite = 0.6*(sc/(1.0+abs(sc))) + 0.4*fund_score
+
+        return {"symbol":sym,"trad":trad,"n":st["n"],"corr":st["corr"],"r2":st["r2"],"beta":st["beta"],"beta_vol":st["beta_vol"],
+                "quant_score":sc,"fund_score":fund_score,"composite_score":composite,"coint_pv":pv,
+                "price_A":price_A_latest,"price_B":price_B_latest,
+                "units_A":sizing["uA"],"units_B_full":sizing["uB_full"],"units_B":sizing["uB"],
+                "num_token":num_token,"fund_metrics":fund_metrics}
+    except Exception:
+        return None
+
+# ---------------- entrypoint ----------------
+if __name__ == "__main__":
+    main()
